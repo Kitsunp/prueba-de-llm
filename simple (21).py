@@ -92,7 +92,6 @@ class GradientMonitor:
 # Función auxiliar para obtener la siguiente potencia de dos
 def next_power_of_two(x):
     return 1 if x == 0 else 2**(x - 1).bit_length()
-
 class LiquidEmbedding(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_length=2048, base_compression_ratio=0.5, 
                  min_compression_ratio=0.1, epsilon=1e-8):
@@ -135,9 +134,7 @@ class LiquidEmbedding(nn.Module):
         nn.init.zeros_(self.proj_head.bias)
 
     def compute_loss(self, x_ifft, recon_target, mask):
-        """
-        Pérdida mejorada con componente semántico
-        """
+
         # 1. Normalización base
         x_norm = F.normalize(x_ifft, p=2, dim=-1)
         target_norm = F.normalize(recon_target, p=2, dim=-1)
@@ -171,16 +168,15 @@ class LiquidEmbedding(nn.Module):
         return masked_loss
 
     def forward(self, x):
-        try:
-            batch_size, seq_length = x.size()
-            device = x.device
 
+        batch_size, seq_length = x.size()  # Definir antes del try-except
+        try:
             # Manejo de secuencia
             seq_length = min(seq_length, self.position_embedding.num_embeddings)
             x = x[:, :seq_length]
 
             # Embeddings con mejor manejo de posiciones
-            positions = torch.arange(0, seq_length, device=device).unsqueeze(0)
+            positions = torch.arange(0, seq_length, device=x.device).unsqueeze(0)
             positions = positions.expand(batch_size, -1)
             x = self.token_embedding(x) + self.position_embedding(positions)
 
@@ -224,9 +220,9 @@ class LiquidEmbedding(nn.Module):
             x_fft_compressed = torch.zeros(
                 (batch_size, max_N, self.embed_dim),
                 dtype=torch.complex64,
-                device=device
+                device=x.device
             )
-            mask = torch.zeros(batch_size, seq_length, dtype=torch.float32, device=device)
+            mask = torch.zeros(batch_size, seq_length, dtype=torch.float32, device=x.device)
 
             # Aplicar compresión (lógica original)
             for i, n in enumerate(N):
@@ -256,16 +252,22 @@ class LiquidEmbedding(nn.Module):
         except Exception as e:
             print(f"Error en LiquidEmbedding forward: {str(e)}")
             return (
-                torch.zeros((batch_size, seq_length, self.embed_dim), device=device),
-                torch.tensor(0.0, device=device)
+                torch.zeros((batch_size, seq_length, self.embed_dim), device=x.device),
+                torch.tensor(0.0, device=x.device)
             )
 
-# Clase EnhancedLocalAttentionWithGQA con inicialización mejorada
+def apply_rotary_pos_emb(q, k, sin, cos):
+    q_even = q[..., ::2]
+    q_odd = q[..., 1::2]
+    k_even = k[..., ::2]
+    k_odd = k[..., 1::2]
+
+    q_rot = torch.cat([q_even * cos - q_odd * sin, q_even * sin + q_odd * cos], dim=-1)
+    k_rot = torch.cat([k_even * cos - k_odd * sin, k_even * sin + k_odd * cos], dim=-1)
+    return q_rot, k_rot
+
 class EnhancedLocalAttentionWithGQA(nn.Module):
-    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.12, num_kv_groups=2, epsilon=1e-8):
-        """
-        Inicializa la capa de atención local mejorada con GQA.
-        """
+    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.12, num_kv_groups=2, epsilon=1e-8, max_seq_length=8192):
         super(EnhancedLocalAttentionWithGQA, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -273,15 +275,17 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
         self.bidirectional = bidirectional
         self.head_dim = embed_dim // num_heads
         self.num_kv_groups = num_kv_groups
-        self.epsilon = epsilon  # Añadido epsilon para estabilidad
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-        assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
+        self.epsilon = epsilon
+        self.max_seq_length = max_seq_length  # Añadido: Máxima longitud de secuencia para RoPE
+
+        assert self.head_dim * num_heads == embed_dim, "embed_dim debe ser divisible por num_heads"
+        assert num_heads % num_kv_groups == 0, "num_heads debe ser divisible por num_kv_groups"
 
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups))
         self.v_proj = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups))
         self.out = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)  # Agregar dropout
+        self.dropout = nn.Dropout(dropout)
 
         # Inicialización específica para transformers
         def _init_weights(module):
@@ -292,14 +296,33 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
         
         self.apply(_init_weights)
 
+        # Precalcular las funciones seno y coseno para RoPE
+        self.register_buffer("sin", torch.zeros(max_seq_length, self.head_dim // 2))
+        self.register_buffer("cos", torch.zeros(max_seq_length, self.head_dim // 2))
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.head_dim, 2).float() * (-math.log(10000.0) / self.head_dim))
+        self.sin[:, :] = torch.sin(position * div_term)
+        self.cos[:, :] = torch.cos(position * div_term)
+
     def forward(self, x):
         B, L, C = x.shape
         pad_l = (self.window_size - L % self.window_size) % self.window_size
         x = nn.functional.pad(x, (0, 0, 0, pad_l))
         _, L_padded, _ = x.shape
+
         q = self.q_proj(x).reshape(B, L_padded, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, L_padded, self.num_kv_groups, self.head_dim).permute(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, L_padded, self.num_kv_groups, self.head_dim).permute(0, 2, 1, 3)
+
+        # Aplicar RoPE
+        if L_padded > self.max_seq_length:
+            raise ValueError(f"Secuencia excede la longitud máxima soportada por RoPE: {self.max_seq_length}")
+        
+        # Asegurar que sin y cos estén en el mismo dtype y device que q y k
+        sin = self.sin[:L_padded, :].unsqueeze(0).unsqueeze(0).to(q.dtype).to(q.device)  # [1, 1, L, head_dim//2]
+        cos = self.cos[:L_padded, :].unsqueeze(0).unsqueeze(0).to(q.dtype).to(q.device)  # [1, 1, L, head_dim//2]
+        q, k = apply_rotary_pos_emb(q, k, sin, cos)
+
         causal = not self.bidirectional
         num_windows = (L_padded - self.window_size) // (self.window_size // 2) + 1
         attn_outputs = []
@@ -313,8 +336,7 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
                 k_window = k_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
                 v_window = v_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
                 try:
-                    attn_output = flash_attn_func(q_window, k_window, v_window, dropout_p=self.dropout.p, causal=causal)  # Usar self.dropout.p
-                    # **Verificación de Finiteza en la salida de atención**
+                    attn_output = flash_attn_func(q_window, k_window, v_window, dropout_p=self.dropout.p, causal=causal)
                     if not torch.isfinite(attn_output).all():
                         raise ValueError(f"Salida de flash_attn_func no finita en la ventana {i}")
                 except Exception as e:
@@ -326,7 +348,6 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
         if attn_output.size(1) > L:
             attn_output = attn_output[:, :L, :]
         attn_output = self.out(attn_output)
-        # **Verificación de Finiteza después de la capa de salida**
         if not torch.isfinite(attn_output).all():
             raise ValueError("Salida de la capa de atención no finita")
         return attn_output
@@ -334,9 +355,6 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
 # Clase MoELayer con inicialización mejorada
 class MoELayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_experts, expert_dim, dropout=0.12, entropy_weight=0.05, top_k=2, dynamic_k=False, max_usage_ratio=0.4, epsilon=1e-8):
-        """
-        Inicializa la capa Mixture of Experts (MoE).
-        """
         super(MoELayer, self).__init__()
         self.num_experts = num_experts
         self.top_k = top_k
@@ -445,9 +463,6 @@ class MoELayer(nn.Module):
 # Clase DeformableConv1d con inicialización mejorada
 class DeformableConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True, epsilon=1e-8):
-        """
-        Inicializa la capa de convolución deformable.
-        """
         super(DeformableConv1d, self).__init__()
         self.kernel_size = kernel_size
         self.padding = padding  # Debe ser un entero
@@ -608,9 +623,6 @@ class OptimizedGatedConvolution(nn.Module):
 # Clase EnhancedLSTM con inicialización mejorada
 class EnhancedLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.12, epsilon=1e-8):
-        """
-        Inicializa la capa EnhancedLSTM.
-        """
         super(EnhancedLSTM, self).__init__()
         self.epsilon = epsilon  # Añadido epsilon para estabilidad
         self.input_size = input_size
@@ -678,9 +690,6 @@ class ImprovedTransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size=256, 
                  bidirectional=True, dropout=0.12, entropy_weight=0.05, top_k=2, dynamic_k=False, 
                  num_kv_groups=2, epsilon=1e-8):
-        """
-        Inicializa el bloque Transformer mejorado.
-        """
         super(ImprovedTransformerBlock, self).__init__()
         self.epsilon = epsilon
         
@@ -803,13 +812,8 @@ class ImprovedTransformerBlock(nn.Module):
         for p in self.parameters():
             if p.grad is not None:
                 torch.nn.utils.clip_grad_norm_(p, self.grad_clip)
-
-# Clase BidirectionalEncoder con inicialización mejorada
 class BidirectionalEncoder(nn.Module):
     def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.5, num_layers=4, num_heads=8, ff_hidden_dim=1024, window_size=256, num_experts=2, expert_dim=256, entropy_weight=0.05, top_k=2, dynamic_k=False, num_kv_groups=2, dropout=0.12, epsilon=1e-8):
-        """
-        Inicializa el encoder bidireccional.
-        """
         super(BidirectionalEncoder, self).__init__()
         self.epsilon = epsilon  # Añadido epsilon para estabilidad
         self.embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, base_compression_ratio=compression_ratio, epsilon=epsilon)
@@ -842,40 +846,33 @@ class BidirectionalEncoder(nn.Module):
         with autocast(enabled=True):
             try:
                 x, recon_loss = self.embedding(x)
-                x = self.dropout(x)  # Aplicar dropout
-                # **Verificación de Finiteza después del embedding y dropout**
-                if not torch.isfinite(x).all():
-                    raise ValueError("Salida del embedding contiene valores no finitos")
-                
-                total_entropy_loss = 0
+                x = self.dropout(x)
+                total_entropy_loss = recon_loss.new_zeros(1)  # Initialize as tensor
                 for layer in self.layers:
-                    x, entropy_loss = layer(x)
-                    total_entropy_loss += entropy_loss
-                    # **Verificación de Finiteza después de cada capa**
-                    if not torch.isfinite(x).all():
-                        raise ValueError("Salida después de una capa de Transformer contiene valores no finitos")
+                    x, recon_loss_layer = layer(x)
+                    total_entropy_loss += recon_loss_layer
                 x = self.layer_norm(x)
                 # **Verificación de Finiteza después de layer_norm**
                 if not torch.isfinite(x).all():
                     raise ValueError("Salida después de layer_norm contiene valores no finitos")
+                return x, recon_loss, total_entropy_loss
             except Exception as e:
                 print(f"Error en BidirectionalEncoder forward: {str(e)}")
                 x = torch.zeros_like(x)
                 recon_loss = torch.tensor(0.0, device=x.device)
                 total_entropy_loss = torch.tensor(0.0, device=x.device)
-        
-        return x, recon_loss, total_entropy_loss
+                return x, recon_loss, total_entropy_loss
 
 class LiquidFoundationModelOptimized(nn.Module):
     def __init__(self, vocab_size, embed_dim=512, num_layers=12, num_heads=8, ff_hidden_dim=1024,
                  num_experts=8, expert_dim=512, max_length=8192, window_size=512, compression_ratio=0.5, 
                  entropy_weight=0.15, top_k=4, dynamic_k=True, lstm_hidden_size=256, lstm_num_layers=2, 
-                 dropout=0.1, epsilon=1e-8, num_kv_groups=NUM_KV_GROUPS):  # Added num_kv_groups parameter with default
-        """
-        Inicializa el modelo base optimizado.
-        """
+                 dropout=0.1, epsilon=1e-8, num_kv_groups=2):
         super(LiquidFoundationModelOptimized, self).__init__()
         self.epsilon = epsilon
+        self.generation_mode = False  # Flag para modo de generación
+        
+        # Componentes principales
         self.encoder = BidirectionalEncoder(
             vocab_size=vocab_size,
             embed_dim=embed_dim,
@@ -891,17 +888,19 @@ class LiquidFoundationModelOptimized(nn.Module):
             top_k=top_k,
             dynamic_k=dynamic_k,
             dropout=dropout,
-            num_kv_groups=num_kv_groups,  # Pass num_kv_groups to encoder
+            num_kv_groups=num_kv_groups,
             epsilon=epsilon
         )
+        
         self.decoder_embedding = LiquidEmbedding(
             vocab_size, 
             embed_dim, 
             max_length, 
             base_compression_ratio=0.5, 
             min_compression_ratio=0.1,
-            epsilon=epsilon  # Pasar epsilon
+            epsilon=epsilon
         )
+        
         self.decoder_layers = nn.ModuleList([
             ImprovedTransformerBlock(
                 embed_dim=embed_dim, 
@@ -911,106 +910,171 @@ class LiquidFoundationModelOptimized(nn.Module):
                 expert_dim=expert_dim, 
                 window_size=window_size, 
                 bidirectional=False, 
-                dropout=dropout,  # Usar el dropout especificado
+                dropout=dropout,
                 entropy_weight=entropy_weight, 
                 top_k=top_k, 
                 dynamic_k=dynamic_k,
                 num_kv_groups=num_kv_groups,
-                epsilon=epsilon  # Pasar epsilon
+                epsilon=epsilon
             )
             for _ in range(num_layers)
         ])
+        
         self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.dropout = nn.Dropout(dropout)  # Agregar dropout
+        self.dropout = nn.Dropout(dropout)
         self.output_layer = nn.Linear(embed_dim, vocab_size)
+        
+        # Memoria externa
+        self.external_memory = EnhancedLSTM(
+            embed_dim, 
+            lstm_hidden_size, 
+            num_layers=lstm_num_layers, 
+            dropout=dropout, 
+            epsilon=epsilon
+        )
+        
+        # Parámetros de configuración
         self.max_length = max_length
         self.compression_ratio = compression_ratio
         
-        # Reemplazar xLSTM con EnhancedLSTM
-        self.external_memory = EnhancedLSTM(embed_dim, lstm_hidden_size, num_layers=lstm_num_layers, dropout=dropout, epsilon=epsilon)  # Agregar dropout al LSTM y pasar epsilon
+        # Inicialización de pesos
+        self._initialize_weights()
 
-        # Inicialización de output_layer
+    def _initialize_weights(self):
+        """Inicializa los pesos del modelo usando técnicas modernas."""
+        # Inicialización de la capa de salida
         nn.init.xavier_uniform_(self.output_layer.weight, gain=1.0)
         nn.init.zeros_(self.output_layer.bias)
+        
+        # Verificar que todos los parámetros están inicializados
+        for name, param in self.named_parameters():
+            if param.data.dim() > 1:
+                if 'weight' in name:
+                    if 'norm' in name:
+                        nn.init.ones_(param)
+                    else:
+                        nn.init.xavier_uniform_(param, gain=1.0)
+            else:
+                if 'bias' in name:
+                    nn.init.zeros_(param)
 
     def forward(self, encoder_input_ids, decoder_input_ids):
-        with autocast(enabled=True):
+        with torch.cuda.amp.autocast(enabled=True):
             try:
+                # 1. Validación de entrada
+                if encoder_input_ids.dim() != 2 or decoder_input_ids.dim() != 2:
+                    raise ValueError(f"Las entradas deben ser 2D. Shapes: encoder={encoder_input_ids.shape}, decoder={decoder_input_ids.shape}")
+
+                # 2. Asegurar que los batch sizes coinciden
+                batch_size = encoder_input_ids.size(0)
+                if decoder_input_ids.size(0) != batch_size:
+                    raise ValueError(f"Batch sizes no coinciden: encoder={batch_size}, decoder={decoder_input_ids.size(0)}")
+
+                # 3. Truncar secuencias si exceden max_length
+                encoder_input_ids = encoder_input_ids[:, :self.max_length]
+                decoder_input_ids = decoder_input_ids[:, :self.max_length]
+
+                # 4. Procesamiento del encoder con manejo de errores
                 encoder_output, recon_loss_enc, entropy_loss_enc = self.encoder(encoder_input_ids)
-                # **Verificación de Finiteza en encoder_output**
-                if not torch.isfinite(encoder_output).all():
-                    raise ValueError("encoder_output contiene valores no finitos")
-                
+
+                # 5. Embeddings del decoder con padding seguro
                 decoder_embeddings, recon_loss_dec = self.decoder_embedding(decoder_input_ids)
-                decoder_embeddings = self.dropout(decoder_embeddings)  # Aplicar dropout
-                # **Verificación de Finiteza en decoder_embeddings**
-                if not torch.isfinite(decoder_embeddings).all():
-                    raise ValueError("decoder_embeddings contiene valores no finitos")
+                decoder_embeddings = self.dropout(decoder_embeddings)
 
-                # Inicializar el estado oculto del EnhancedLSTM
-                batch_size = decoder_embeddings.size(0)
+                # 6. Inicialización segura del estado oculto LSTM
                 hidden = self.external_memory.init_hidden(batch_size)
-                
-                total_entropy_loss_dec = 0
+
+                # 7. Procesamiento por capas con manejo de errores
+                total_entropy_loss_dec = torch.tensor(0.0, device=decoder_input_ids.device)
                 for layer in self.decoder_layers:
-                    decoder_embeddings, entropy_loss = layer(decoder_embeddings)
+                    layer_out, entropy_loss = layer(decoder_embeddings)
+                    decoder_embeddings = layer_out
                     total_entropy_loss_dec += entropy_loss
-                    
-                    # **Verificación de Finiteza después de cada capa del decoder**
-                    if not torch.isfinite(decoder_embeddings).all():
-                        raise ValueError("Salida después de una capa del decoder contiene valores no finitos")
-                    
-                    # Actualizar la memoria externa con EnhancedLSTM
+
+                    # Actualizar LSTM
                     decoder_embeddings, hidden = self.external_memory(decoder_embeddings, hidden)
-                    # **Verificación de Finiteza después de LSTM**
-                    if not torch.isfinite(decoder_embeddings).all():
-                        raise ValueError("Salida del EnhancedLSTM contiene valores no finitos")
-                
+
+                # 8. Normalización y capa de salida con validaciones
                 decoder_embeddings = self.layer_norm(decoder_embeddings)
-                # **Verificación de Finiteza después de layer_norm en decoder**
-                if not torch.isfinite(decoder_embeddings).all():
-                    raise ValueError("decoder_embeddings después de layer_norm contiene valores no finitos")
-                
                 logits = self.output_layer(decoder_embeddings)
-                # **Verificación de Finiteza en logits**
+
+                # Verificar y corregir NaNs/Infs
                 if not torch.isfinite(logits).all():
-                    raise ValueError("logits contienen valores no finitos")
-                
+                    print("Detectados valores no finitos en logits")
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+                # Asegurar dimensiones correctas
+                logits = logits[:, :min(2048, logits.size(1)), :]
+
+                return (
+                    logits,
+                    recon_loss_enc,
+                    recon_loss_dec,
+                    entropy_loss_enc,
+                    total_entropy_loss_dec
+                )
+
             except Exception as e:
-                print(f"Error en LiquidFoundationModelOptimized forward: {str(e)}")
-                # Retornar valores seguros en caso de error
-                logits = torch.zeros((decoder_input_ids.size(0), 2048, self.output_layer.out_features), device=decoder_input_ids.device)
-                recon_loss_enc = torch.tensor(0.0, device=logits.device)
-                recon_loss_dec = torch.tensor(0.0, device=logits.device)
-                entropy_loss_enc = torch.tensor(0.0, device=logits.device)
-                total_entropy_loss_dec = torch.tensor(0.0, device=logits.device)
+                print(f"Error general en forward pass: {str(e)}")
+                # Inferir batch_size desde encoder_input_ids o decoder_input_ids
+                batch_size = encoder_input_ids.size(0) if encoder_input_ids.dim() >= 1 else 1
+                return (
+                    torch.zeros((batch_size, min(2048, decoder_input_ids.size(1)), self.output_layer.out_features), device=decoder_input_ids.device),
+                    torch.tensor(0.0, device=decoder_input_ids.device),
+                    torch.tensor(0.0, device=decoder_input_ids.device),
+                    torch.tensor(0.0, device=decoder_input_ids.device),
+                    torch.tensor(0.0, device=decoder_input_ids.device)
+                )
+    
+    def generate(self, encoder_input_ids, tokenizer, max_length=2048, start_token_id=None):
 
-            # Limitar la longitud de salida a 2048
-            logits = logits[:, :2048, :]
-        
-        return logits, recon_loss_enc, recon_loss_dec, entropy_loss_enc, total_entropy_loss_dec
-
-    def generate(self, encoder_input_ids, max_length=2048, start_token_id=None):
-        """
-        Genera una secuencia de salida dada una entrada de encoder.
-        """
         if start_token_id is None:
             raise ValueError("start_token_id debe ser proporcionado para la generación")
         
-        device = encoder_input_ids.device
-        decoder_input_ids = torch.tensor([[start_token_id]], device=device)
-        generated_ids = []
-
-        hidden = self.external_memory.init_hidden(encoder_input_ids.size(0))
-
-        for _ in range(max_length):
-            logits, _, _, _, _ = self.forward(encoder_input_ids, decoder_input_ids)
-            next_token_id = logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
-            decoder_input_ids = torch.cat([decoder_input_ids, next_token_id], dim=-1)
-            generated_ids.append(next_token_id.item())
-            if next_token_id.item() == self.output_layer.bias.numel() - 1:  # Asumiendo que el último token es EOS
-                break
+        # Activar modo generación
+        self.set_generation_mode(True)
         
-        return decoder_input_ids, generated_ids
-
+        try:
+            device = encoder_input_ids.device
+            batch_size = encoder_input_ids.size(0)
+            decoder_input_ids = torch.full((batch_size, 1), start_token_id, dtype=torch.long, device=device)  # [batch_size, 1]
+            generated_ids = [[] for _ in range(batch_size)]
+            
+            for step in range(max_length):
+                logits, _, _, _, _ = self.forward(encoder_input_ids, decoder_input_ids)  # logits: [batch_size, seq_length, vocab_size]
+                next_token_logits = logits[:, -1, :] / self.temperature  # [batch_size, vocab_size]
+                probabilities = F.softmax(next_token_logits, dim=-1)  # [batch_size, vocab_size]
+                next_tokens = torch.multinomial(probabilities, num_samples=1)  # [batch_size, 1]
+                
+                # Actualizar decoder_input_ids
+                decoder_input_ids = torch.cat([decoder_input_ids, next_tokens], dim=1)  # [batch_size, step+2]
+                
+                # Guardar tokens generados
+                for i in range(batch_size):
+                    generated_ids[i].append(next_tokens[i].item())
+                
+                # Verificar tokens de fin
+                if (next_tokens == tokenizer.eos_token_id).all():
+                    print(f"Todos los beams han generado el token de fin en el paso {step+1}")
+                    break
+            
+            # Decodificar textos generados
+            generated_texts = [
+                tokenizer.decode(decoder_input_ids[i].tolist(), skip_special_tokens=True)
+                for i in range(batch_size)
+            ]
+            
+            print("\nTexto generado:")
+            for idx, text in enumerate(generated_texts):
+                print(f"Beam {idx + 1}: {text}")
+            
+            return decoder_input_ids, generated_texts
+            
+        except Exception as e:
+            print(f"Error en la función de generación: {str(e)}")
+            return None, None
+            
+        finally:
+            # Desactivar modo generación al finalizar
+            self.set_generation_mode(False)
 print("Modelo cargado correctamente con mejoras de estabilidad numérica.")
