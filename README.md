@@ -2,49 +2,187 @@
 
 Este repositorio contiene el código para un modelo de generación de texto llamado "Liquid Foundation". El modelo está diseñado con un enfoque en la eficiencia y el rendimiento, incorporando varias técnicas avanzadas y optimizaciones arquitectónicas.  Su objetivo es generar texto de alta calidad de manera eficiente, abordando las limitaciones de los modelos tradicionales de generación de texto, como la complejidad computacional y la dificultad para capturar dependencias a largo plazo.
 
-## Arquitectura del Modelo
+## Arquitectura del Modelo (Detalle Extendido)
 
-La arquitectura central del modelo, definida en `simple.py`, se basa en una estructura similar a la de un transformador, pero con mejoras significativas para optimizar el rendimiento y la eficiencia.  A continuación, se detallan los componentes clave:
+La arquitectura central del modelo, definida en `simple.py`, se basa en una estructura similar a la de un transformador, pero con mejoras significativas para optimizar el rendimiento y la eficiencia.  A continuación, se detallan los componentes clave con una explicación exhaustiva de cada capa:
 
 ### Liquid Embedding (Incrustación Líquida)
 
-La capa `LiquidEmbedding` es una capa de incrustación personalizada que va más allá de las incrustaciones de palabras tradicionales.  Incorpora capas convolucionales y un mecanismo de compresión adaptativa basado en la complejidad de la secuencia.
+La capa `LiquidEmbedding` es el primer paso en el procesamiento de la entrada de texto.  Su función principal es convertir cada token de entrada en una representación vectorial densa, también conocida como incrustación o embedding.  Esta capa no se limita a una simple búsqueda en una tabla de embeddings, sino que incorpora elementos adicionales para enriquecer la representación de los tokens.
 
-Las capas convolucionales permiten que el modelo capture características locales y dependencias contextuales dentro de la secuencia de entrada.  Esto es crucial para comprender el significado de las palabras en su contexto.
+**Incrustación de Tokens y Posiciones:**
 
-El mecanismo de compresión adaptativa ajusta dinámicamente la cantidad de información retenida de la incrustación en función de la complejidad de la secuencia.  Para secuencias más cortas o menos complejas, el modelo comprime la incrustación, optimizando el uso de recursos.  Para secuencias más largas y complejas, el modelo retiene más información de la incrustación, lo que permite una mejor representación de la entrada.  Este enfoque dinámico ayuda a equilibrar la eficiencia computacional con la calidad de la representación.
+Inicialmente, cada token se incrusta utilizando `nn.Embedding(vocab_size, embed_dim)`, que es una capa de embedding estándar.  Esto asigna a cada token un vector de `embed_dim` dimensiones.  Simultáneamente, se agrega información posicional utilizando `nn.Embedding(max_length, embed_dim)`.  Esta incrustación posicional proporciona al modelo información sobre la posición de cada token en la secuencia, lo cual es fundamental para el procesamiento de secuencias, ya que el orden de las palabras es crucial para el significado.
 
-### Atención Local Mejorada con Group Query Attention (GQA)
+**Capas Convolucionales:**
 
-El componente `EnhancedLocalAttentionWithGQA` utiliza atención local dentro de un tamaño de ventana definido para mejorar la eficiencia computacional.  A diferencia de la atención global, que calcula las relaciones entre todos los tokens en la secuencia, la atención local se centra en una ventana alrededor de cada token.  Esto reduce significativamente la complejidad computacional de O(n^2) a O(n*w), donde n es la longitud de la secuencia y w es el tamaño de la ventana.
+Después de las incrustaciones iniciales, se aplican dos capas convolucionales 1D (`nn.Conv1d`).  Estas capas convolucionales escanean la secuencia de embeddings, aplicando un filtro que captura características locales y dependencias contextuales entre tokens adyacentes.  La función de activación GELU (`F.gelu`) se aplica después de cada capa convolucional para introducir no linealidad, permitiendo que el modelo aprenda relaciones más complejas entre los tokens.
 
-Además de la atención local, este componente incorpora Group Query Attention (GQA).  GQA divide las consultas en grupos y calcula la atención para cada grupo por separado.  Esto reduce aún más la complejidad computacional y la huella de memoria, lo que hace que el modelo sea más escalable para secuencias largas.
+**Normalización y Dropout:**
 
-Para manejar la información posicional, crucial para comprender el orden de las palabras en una secuencia, se integran Rotary Position Embeddings (RoPE).  RoPE codifica la información posicional directamente en las incrustaciones, lo que permite que el modelo tenga en cuenta el orden de las palabras al calcular la atención.
+La capa `nn.LayerNorm` normaliza las embeddings resultantes, estabilizando el entrenamiento y mejorando la convergencia.  La capa `nn.Dropout` aplica dropout, una técnica de regularización que previene el sobreajuste al desactivar aleatoriamente un porcentaje de las neuronas durante el entrenamiento.
 
-### Mezcla de Expertos (MoE)
+**Compresión Adaptativa y Transformada de Fourier Rápida (FFT):**
 
-La capa `MoELayer` implementa una estrategia de Mezcla de Expertos (MoE).  En un MoE, la entrada se enruta a un subconjunto de "expertos", cada uno de los cuales es una red neuronal independiente.  Esto permite que el modelo aprenda representaciones especializadas para diferentes partes del espacio de entrada.
+Para optimizar la eficiencia, la capa `LiquidEmbedding` implementa un mecanismo de compresión adaptativa.  Primero, se aplica la Transformada de Fourier Rápida (FFT) a la secuencia de embeddings.  La FFT descompone la secuencia en sus componentes de frecuencia, lo que permite al modelo analizar la complejidad de la secuencia.  La complejidad se estima basándose en la magnitud de los componentes de frecuencia.  Secuencias más complejas tendrán componentes de frecuencia más altos.
 
-El modelo utiliza enrutamiento dinámico de expertos, lo que significa que la selección de expertos para cada token de entrada se determina dinámicamente durante el entrenamiento.  Esto permite que el modelo adapte la asignación de expertos a los datos de entrada.
+En función de la complejidad estimada, el modelo ajusta dinámicamente la tasa de compresión.  Para secuencias menos complejas, se aplica una mayor compresión, reduciendo la dimensionalidad de las embeddings y optimizando el uso de recursos.  Para secuencias más complejas, se aplica una menor compresión, preservando más información de la incrustación.
 
-Además, se implementa la regularización de uso de expertos para evitar que un solo experto domine el proceso y fomentar la especialización entre los expertos.  Esto asegura que todos los expertos contribuyan al aprendizaje y que el modelo pueda capturar una gama más amplia de patrones en los datos.
+**Proyección y Reconstrucción:**
 
-### Convolución Deformable y Convolución Optimizada con Puerta
+Después de la compresión, se aplica una capa lineal (`nn.Linear`) para proyectar las embeddings comprimidas de vuelta al espacio original.  Finalmente, se calcula una pérdida de reconstrucción que compara las embeddings reconstruidas con las embeddings originales antes de la compresión.  Esta pérdida de reconstrucción fomenta que el modelo aprenda representaciones comprimidas que conserven la mayor cantidad de información posible.
 
-El modelo utiliza dos tipos de convoluciones: `DeformableConv1d` y `OptimizedGatedConvolution`.
+### Enhanced Local Attention with Group Query Attention (GQA)
 
-`DeformableConv1d` introduce convoluciones deformables, que permiten que el modelo aprenda desplazamientos para los puntos de muestreo.  Esto permite que el modelo se adapte a diferentes formas y patrones en los datos, capturando características más relevantes y contextuales.
+La capa `EnhancedLocalAttentionWithGQA` es un componente crucial del modelo que calcula la atención entre los tokens de la secuencia.  Combina atención local con Group Query Attention (GQA) y Rotary Position Embeddings (RoPE) para lograr una atención eficiente y efectiva.
 
-`OptimizedGatedConvolution` combina convoluciones deformables con mecanismos de puerta.  Las puertas controlan el flujo de información a través de la red, permitiendo que el modelo aprenda qué características son importantes para cada entrada.  Además, se aplica normalización para estabilizar el entrenamiento y mejorar la convergencia.
+**Atención Local:**
 
-### LSTM Mejorado
+La atención local restringe el cálculo de la atención a una ventana alrededor de cada token.  Esto reduce significativamente la complejidad computacional en comparación con la atención global, que considera todos los pares de tokens en la secuencia.  El tamaño de la ventana es un hiperparámetro que controla el alcance de la atención local.
 
-El componente `EnhancedLSTM` integra un módulo LSTM (Long Short-Term Memory) como memoria externa.  El LSTM es una red neuronal recurrente que es particularmente efectiva para capturar dependencias a largo plazo en secuencias.  En este modelo, el LSTM actúa como un búfer de memoria, almacenando información relevante de pasos de tiempo anteriores.  Esta información contextual se utiliza para informar la generación de texto en pasos de tiempo posteriores, lo que permite que el modelo genere texto más coherente y contextualmente relevante.
+**Group Query Attention (GQA):**
 
-### Bloque Transformador Mejorado
+GQA divide las queries en grupos y calcula la atención para cada grupo por separado.  Esto reduce aún más la complejidad computacional y la huella de memoria, lo que permite escalar el modelo a secuencias más largas.  El número de grupos es un hiperparámetro que controla la granularidad de GQA.
 
-El `ImprovedTransformerBlock` combina todos los componentes anteriores en un bloque transformador.  Utiliza normalización previa a la capa (Pre-LN), lo que significa que la normalización de capa se aplica antes de la atención y las capas de feedforward.  Se ha demostrado que Pre-LN mejora la estabilidad del entrenamiento, especialmente para modelos profundos.  El bloque también incluye optimizaciones adicionales para mejorar el rendimiento y la estabilidad numérica.
+**Rotary Position Embeddings (RoPE):**
+
+RoPE codifica la información posicional directamente en las incrustaciones de queries y keys.  Esto permite que el modelo tenga en cuenta la posición relativa de los tokens al calcular la atención, lo cual es fundamental para el procesamiento de secuencias.  RoPE es una alternativa más eficiente a los embeddings posicionales absolutos, ya que no requiere una matriz de embeddings separada.
+
+**Cálculo de la Atención:**
+
+El cálculo de la atención se realiza utilizando la función `flash_attn_func`, que es una implementación optimizada de la atención.  La función calcula los pesos de atención para cada par de query y key dentro de la ventana local y los grupos de queries.  Estos pesos de atención se utilizan para combinar los valores (values) correspondientes, produciendo una representación contextualizada de cada token.
+
+### Mixture of Experts (MoE) - (Mezcla de Expertos)
+
+La capa `MoELayer` implementa una estrategia de Mixture of Experts (MoE), donde la entrada se enruta a un subconjunto de "expertos", cada uno de los cuales es una red neuronal independiente especializada en un aspecto particular de los datos.
+
+**Routing de Expertos (Enrutamiento):**
+
+El enrutamiento de los tokens de entrada a los expertos se realiza mediante una "puerta" (gate).  La puerta es una capa lineal que produce un conjunto de pesos para cada experto.  Estos pesos se interpretan como probabilidades, y se utilizan para determinar a qué expertos se enruta cada token.  El enrutamiento dinámico permite que el modelo adapte la selección de expertos a los datos de entrada, lo que resulta en un procesamiento más especializado.
+
+**Expertos:**
+
+Cada experto es una red neuronal lineal que transforma la entrada.  El número de expertos y la dimensionalidad de sus salidas son hiperparámetros del modelo.  La idea detrás de MoE es que cada experto se especialice en un subconjunto del espacio de entrada, lo que permite que el modelo capture una gama más amplia de patrones en los datos.
+
+**Agregación de Salidas de Expertos:**
+
+Las salidas de los expertos seleccionados se combinan utilizando los pesos generados por la puerta.  Esta combinación ponderada produce una representación final que integra las contribuciones de los expertos más relevantes para la entrada dada.
+
+**Regularización de Uso de Expertos:**
+
+Para evitar que un solo experto domine el proceso y fomentar la especialización entre los expertos, se aplica una regularización de uso.  Esta regularización penaliza el uso excesivo de un experto, asegurando que todos los expertos contribuyan al aprendizaje y que el modelo pueda capturar una gama más amplia de patrones en los datos.  Además, se calcula la entropía de los pesos de la puerta y se utiliza como una forma de regularización para fomentar una distribución más uniforme del uso de expertos.
+
+### Deformable Convolution (Convolución Deformable) - `DeformableConv1d`
+
+La capa `DeformableConv1d` implementa una convolución deformable unidimensional.  A diferencia de las convoluciones tradicionales, que aplican un filtro fijo a la entrada, las convoluciones deformables permiten que el modelo aprenda desplazamientos para los puntos de muestreo del filtro.  Esto permite que el modelo adapte el filtro a la entrada, capturando características más relevantes y contextuales.
+
+**Cálculo de Offsets (Desplazamientos):**
+
+Los desplazamientos para los puntos de muestreo se calculan mediante una capa convolucional separada (`offset_conv`).  Esta capa toma la entrada y produce un conjunto de desplazamientos para cada punto de muestreo del filtro.  Los desplazamientos se aprenden durante el entrenamiento, lo que permite que el modelo optimice la forma del filtro para la tarea específica.
+
+**Muestreo Deformable:**
+
+Utilizando los desplazamientos calculados, el modelo muestrea la entrada en ubicaciones deformadas.  Esto permite que el filtro capture información de diferentes partes de la entrada, adaptándose a la forma y la estructura de los datos.
+
+**Convolución:**
+
+Después del muestreo deformable, se aplica una convolución estándar con un tamaño de kernel de 1.  Esta convolución combina las muestras deformadas para producir la salida final.
+
+### Optimized Gated Convolution (Convolución Optimizada con Puerta) - `OptimizedGatedConvolution`
+
+La capa `OptimizedGatedConvolution` combina una convolución deformable con un mecanismo de puerta.  Esto permite que el modelo controle el flujo de información a través de la red, aprendiendo qué características son importantes para cada entrada.
+
+**Convolución Deformable:**
+
+Se utiliza una capa `DeformableConv1d` para capturar características deformables de la entrada.
+
+**Mecanismo de Puerta:**
+
+La salida de la convolución deformable se divide en dos partes: una parte "principal" y una parte "puerta".  La parte principal se pasa a través de una función de activación GELU.  La parte puerta se pasa a través de una función sigmoide, produciendo un conjunto de pesos entre 0 y 1.
+
+**Combinación con Puerta:**
+
+La parte principal y la parte puerta se combinan multiplicando elemento por elemento.  Esto permite que la puerta controle la cantidad de información que fluye de la parte principal a la siguiente capa.  Los pesos de la puerta se aprenden durante el entrenamiento, lo que permite que el modelo optimice el flujo de información para la tarea específica.
+
+**Normalización y Dropout:**
+
+Después de la combinación con puerta, se aplica normalización y dropout para estabilizar el entrenamiento y prevenir el sobreajuste.
+
+### Enhanced LSTM (LSTM Mejorado) - `EnhancedLSTM`
+
+La capa `EnhancedLSTM` utiliza un módulo LSTM (Long Short-Term Memory) para modelar dependencias a largo plazo en la secuencia de entrada.  El LSTM es una red neuronal recurrente que mantiene un estado oculto que se actualiza en cada paso de tiempo.  Esto permite que el LSTM almacene información de pasos de tiempo anteriores y la utilice para informar el procesamiento de los pasos de tiempo actuales.
+
+**LSTM Estándar:**
+
+Se utiliza una capa `nn.LSTM` estándar con parámetros configurables, como el tamaño oculto y el número de capas.
+
+**Capa de Salida:**
+
+La salida del LSTM se pasa a través de una capa lineal seguida de una función de activación GELU.  Esto permite que el LSTM produzca una representación más compleja de la secuencia de entrada.
+
+**Conexión Residual:**
+
+Se utiliza una conexión residual para combinar la salida del LSTM con la entrada original.  Esto ayuda a estabilizar el entrenamiento y mejorar el flujo de gradientes.
+
+### Improved Transformer Block (Bloque Transformador Mejorado) - `ImprovedTransformerBlock`
+
+El `ImprovedTransformerBlock` es el bloque básico del modelo.  Combina las capas descritas anteriormente en una estructura de transformador con normalización previa a la capa (Pre-LN).
+
+**Normalización Pre-Capa (Pre-LN):**
+
+En Pre-LN, la normalización de capa se aplica antes de la atención y las capas de feedforward.  Esto se ha demostrado que mejora la estabilidad del entrenamiento, especialmente para modelos profundos.
+
+**Atención, Convolución, MoE y Feedforward:**
+
+El bloque aplica las capas `EnhancedLocalAttentionWithGQA`, `OptimizedGatedConvolution`, `MoELayer` y una red feedforward en secuencia.  Cada capa se sigue de una capa de normalización y dropout.
+
+**Conexiones Residuales:**
+
+Se utilizan conexiones residuales alrededor de cada capa para mejorar el flujo de gradientes y estabilizar el entrenamiento.
+
+**Clipping de Gradientes:**
+
+El bloque implementa clipping de gradientes para evitar que los gradientes se vuelvan demasiado grandes durante el entrenamiento, lo que podría causar inestabilidad.
+
+### Bidirectional Encoder (Codificador Bidireccional) - `BidirectionalEncoder`
+
+El `BidirectionalEncoder` es responsable de codificar la secuencia de entrada en una representación contextualizada.  Utiliza múltiples capas `ImprovedTransformerBlock` para procesar la entrada en ambas direcciones (hacia adelante y hacia atrás).
+
+**Incrustación:**
+
+La entrada se incrusta utilizando la capa `LiquidEmbedding`.
+
+**Capas del Transformador:**
+
+Se aplican múltiples capas `ImprovedTransformerBlock` a la secuencia de embeddings.
+
+**Normalización y Dropout:**
+
+La salida del codificador se normaliza y se le aplica dropout.
+
+### LiquidFoundationModelOptimized
+
+Esta es la clase principal del modelo, que combina el codificador bidireccional con un decodificador y una memoria externa LSTM.
+
+**Codificador:**
+
+Se utiliza un `BidirectionalEncoder` para codificar la secuencia de entrada.
+
+**Decodificador:**
+
+El decodificador utiliza una estructura similar al codificador, pero con atención causal, lo que significa que solo atiende a los tokens anteriores en la secuencia.
+
+**Memoria Externa LSTM:**
+
+Se utiliza un `EnhancedLSTM` como memoria externa para almacenar información contextual de la secuencia de entrada.
+
+**Capa de Salida:**
+
+La capa de salida es una capa lineal que proyecta la salida del decodificador al tamaño del vocabulario.
+
+**Generación:**
+
+El modelo implementa un método `generate` para generar texto.  Este método utiliza un proceso de decodificación autoregresiva, donde el modelo genera un token a la vez, condicionando cada nuevo token a los tokens generados previamente.
 
 ## Entrenamiento y Evaluación (Más Detallado)
 
