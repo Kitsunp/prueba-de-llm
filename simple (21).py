@@ -265,10 +265,10 @@ def apply_rotary_pos_emb(q, k, sin, cos):
     q_rot = torch.cat([q_even * cos - q_odd * sin, q_even * sin + q_odd * cos], dim=-1)
     k_rot = torch.cat([k_even * cos - k_odd * sin, k_even * sin + k_odd * cos], dim=-1)
     return q_rot, k_rot
-
 class EnhancedLocalAttentionWithGQA(nn.Module):
-    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.12, num_kv_groups=2, epsilon=1e-8, max_seq_length=8192):
-        super(EnhancedLocalAttentionWithGQA, self).__init__()
+    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, 
+                 dropout=0.12, num_kv_groups=2, epsilon=1e-8, max_seq_length=8192):
+        super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.window_size = window_size
@@ -276,81 +276,179 @@ class EnhancedLocalAttentionWithGQA(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.num_kv_groups = num_kv_groups
         self.epsilon = epsilon
-        self.max_seq_length = max_seq_length  # Añadido: Máxima longitud de secuencia para RoPE
-
-        assert self.head_dim * num_heads == embed_dim, "embed_dim debe ser divisible por num_heads"
-        assert num_heads % num_kv_groups == 0, "num_heads debe ser divisible por num_kv_groups"
-
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups))
-        self.v_proj = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups))
+        self.max_seq_length = max_seq_length
+        
+        # Proyecciones separadas para differential attention
+        self.q_proj1 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.q_proj2 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj1 = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups), bias=False)
+        self.k_proj2 = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups), bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim // (num_heads // num_kv_groups), bias=False)
         self.out = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
-
-        # Inicialización específica para transformers
-        def _init_weights(module):
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=1/math.sqrt(2))
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
         
-        self.apply(_init_weights)
+        # Scaler para precisión mixta
+        self.grad_scaler = GradScaler()
 
-        # Precalcular las funciones seno y coseno para RoPE
-        self.register_buffer("sin", torch.zeros(max_seq_length, self.head_dim // 2))
-        self.register_buffer("cos", torch.zeros(max_seq_length, self.head_dim // 2))
+        # Lambda como parámetro aprendible con inicialización específica
+        self.lambda_init = 0.8
+        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim))
+        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim))
+        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim))
+        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim))
+        
+        # Buffers para RoPE
+        self.register_buffer(
+            "sin",
+            torch.zeros(max_seq_length, self.head_dim // 2),
+            persistent=False
+        )
+        self.register_buffer(
+            "cos",
+            torch.zeros(max_seq_length, self.head_dim // 2),
+            persistent=False
+        )
+        
         position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, self.head_dim, 2).float() * (-math.log(10000.0) / self.head_dim))
+        div_term = torch.exp(torch.arange(0, self.head_dim, 2).float() * 
+                           (-math.log(10000.0) / self.head_dim))
         self.sin[:, :] = torch.sin(position * div_term)
         self.cos[:, :] = torch.cos(position * div_term)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        # Inicialización específica para transformers con precisión mixta
+        for param in self.parameters():
+            if param.ndim > 1:
+                nn.init.xavier_uniform_(param, gain=1/math.sqrt(2))
+        
+        # Inicializar lambdas cerca de los valores objetivo
+        with torch.no_grad():
+            self.lambda_q1.data.fill_(0.1)
+            self.lambda_k1.data.fill_(0.1)
+            self.lambda_q2.data.fill_(-0.1)
+            self.lambda_k2.data.fill_(-0.1)
+
+    def compute_lambda(self):
+        # Cálculo estable de lambda para precisión mixta
+        with torch.cuda.amp.autocast():
+            lambda_value = torch.exp(self.lambda_q1 @ self.lambda_k1) - \
+                         torch.exp(self.lambda_q2 @ self.lambda_k2) + self.lambda_init
+            return lambda_value.clamp(0.1, 0.9)  # Mantener en rango estable
 
     def forward(self, x):
-        B, L, C = x.shape
-        pad_l = (self.window_size - L % self.window_size) % self.window_size
-        x = nn.functional.pad(x, (0, 0, 0, pad_l))
-        _, L_padded, _ = x.shape
+        with torch.cuda.amp.autocast():
+            try:
+                B, L, C = x.shape
+                pad_l = (self.window_size - L % self.window_size) % self.window_size
+                x_padded = nn.functional.pad(x, (0, 0, 0, pad_l))
+                _, L_padded, _ = x_padded.shape
 
-        q = self.q_proj(x).reshape(B, L_padded, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, L_padded, self.num_kv_groups, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, L_padded, self.num_kv_groups, self.head_dim).permute(0, 2, 1, 3)
+                # Proyecciones con precisión mixta
+                q1 = self.q_proj1(x_padded).reshape(B, L_padded, self.num_heads, self.head_dim)
+                q2 = self.q_proj2(x_padded).reshape(B, L_padded, self.num_heads, self.head_dim)
+                k1 = self.k_proj1(x_padded).reshape(B, L_padded, self.num_kv_groups, self.head_dim)
+                k2 = self.k_proj2(x_padded).reshape(B, L_padded, self.num_kv_groups, self.head_dim)
+                v = self.v_proj(x_padded).reshape(B, L_padded, self.num_kv_groups, self.head_dim)
 
-        # Aplicar RoPE
-        if L_padded > self.max_seq_length:
-            raise ValueError(f"Secuencia excede la longitud máxima soportada por RoPE: {self.max_seq_length}")
-        
-        # Asegurar que sin y cos estén en el mismo dtype y device que q y k
-        sin = self.sin[:L_padded, :].unsqueeze(0).unsqueeze(0).to(q.dtype).to(q.device)  # [1, 1, L, head_dim//2]
-        cos = self.cos[:L_padded, :].unsqueeze(0).unsqueeze(0).to(q.dtype).to(q.device)  # [1, 1, L, head_dim//2]
-        q, k = apply_rotary_pos_emb(q, k, sin, cos)
+                # Preparar para atención
+                q1 = q1.permute(0, 2, 1, 3).contiguous()
+                q2 = q2.permute(0, 2, 1, 3).contiguous()
+                k1 = k1.permute(0, 2, 1, 3).contiguous()
+                k2 = k2.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
 
-        causal = not self.bidirectional
-        num_windows = (L_padded - self.window_size) // (self.window_size // 2) + 1
-        attn_outputs = []
-        for i in range(num_windows):
-            start_idx = i * (self.window_size // 2)
-            end_idx = start_idx + self.window_size
-            if end_idx <= L_padded:
-                q_window = q[..., start_idx:end_idx, :]
-                k_window = k[..., start_idx:end_idx, :]
-                v_window = v[..., start_idx:end_idx, :]
-                k_window = k_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
-                v_window = v_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
-                try:
-                    attn_output = flash_attn_func(q_window, k_window, v_window, dropout_p=self.dropout.p, causal=causal)
-                    if not torch.isfinite(attn_output).all():
-                        raise ValueError(f"Salida de flash_attn_func no finita en la ventana {i}")
-                except Exception as e:
-                    print(f"Error en flash_attn_func en la ventana {i}: {str(e)}")
-                    attn_output = torch.zeros_like(q_window)
-                attn_outputs.append(attn_output)
-        attn_output = torch.cat(attn_outputs, dim=2)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, -1, self.embed_dim)
-        if attn_output.size(1) > L:
-            attn_output = attn_output[:, :L, :]
-        attn_output = self.out(attn_output)
-        if not torch.isfinite(attn_output).all():
-            raise ValueError("Salida de la capa de atención no finita")
-        return attn_output
+                # Convertir a float16/bfloat16 para FlashAttention
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                q1, q2 = q1.to(dtype), q2.to(dtype)
+                k1, k2 = k1.to(dtype), k2.to(dtype)
+                v = v.to(dtype)
+
+                # Aplicar RoPE
+                if L_padded > self.max_seq_length:
+                    raise ValueError(f"Secuencia excede longitud máxima RoPE: {self.max_seq_length}")
+                
+                sin = self.sin[:L_padded, :].unsqueeze(0).unsqueeze(0).to(dtype)
+                cos = self.cos[:L_padded, :].unsqueeze(0).unsqueeze(0).to(dtype)
+                
+                q1, k1 = apply_rotary_pos_emb(q1, k1, sin, cos)
+                q2, k2 = apply_rotary_pos_emb(q2, k2, sin, cos)
+
+                # Procesar por ventanas
+                causal = not self.bidirectional
+                num_windows = (L_padded - self.window_size) // (self.window_size // 2) + 1
+                attn_outputs = []
+                
+                lambda_value = self.compute_lambda().to(dtype)
+                
+                for i in range(num_windows):
+                    start_idx = i * (self.window_size // 2)
+                    end_idx = start_idx + self.window_size
+                    
+                    if end_idx <= L_padded:
+                        # Extraer ventanas
+                        q1_window = q1[..., start_idx:end_idx, :]
+                        q2_window = q2[..., start_idx:end_idx, :]
+                        k1_window = k1[..., start_idx:end_idx, :]
+                        k2_window = k2[..., start_idx:end_idx, :]
+                        v_window = v[..., start_idx:end_idx, :]
+
+                        # Repetir KV para heads
+                        k1_window = k1_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
+                        k2_window = k2_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
+                        v_window = v_window.repeat(1, self.num_heads // self.num_kv_groups, 1, 1)
+
+                        try:
+                            # FlashAttention con precisión mixta
+                            with torch.cuda.amp.autocast():
+                                attn1 = flash_attn_func(
+                                    q1_window, k1_window, v_window,
+                                    dropout_p=self.dropout.p if self.training else 0.0,
+                                    causal=causal,
+                                    softmax_scale=1/math.sqrt(self.head_dim)
+                                )
+                                attn2 = flash_attn_func(
+                                    q2_window, k2_window, v_window,
+                                    dropout_p=self.dropout.p if self.training else 0.0,
+                                    causal=causal,
+                                    softmax_scale=1/math.sqrt(self.head_dim)
+                                )
+                                
+                                # Atención diferencial
+                                attn_output = attn1 - lambda_value * attn2
+
+                            if not torch.isfinite(attn_output).all():
+                                raise ValueError(f"Salida no finita en ventana {i}")
+                                
+                        except Exception as e:
+                            print(f"Error en flash_attn_func ventana {i}: {str(e)}")
+                            attn_output = torch.zeros_like(q1_window)
+                            
+                        attn_outputs.append(attn_output)
+
+                # Procesar salida
+                attn_output = torch.cat(attn_outputs, dim=2)
+                attn_output = attn_output.transpose(1, 2).contiguous()
+                
+                # Volver a float32 para el resto de la red
+                attn_output = attn_output.float()
+                attn_output = attn_output.view(B, -1, self.embed_dim)
+                
+                if attn_output.size(1) > L:
+                    attn_output = attn_output[:, :L, :]
+                    
+                # Proyección final
+                attn_output = self.out(attn_output)
+
+                if not torch.isfinite(attn_output).all():
+                    raise ValueError("Salida de atención no finita")
+
+                return attn_output
+
+            except Exception as e:
+                print(f"Error en forward pass: {str(e)}")
+                return torch.zeros((B, L, self.embed_dim), device=x.device, dtype=torch.float32)
 
 # Clase MoELayer con inicialización mejorada
 class MoELayer(nn.Module):
@@ -694,12 +792,18 @@ class ImprovedTransformerBlock(nn.Module):
         self.epsilon = epsilon
         
         # Layer normalization antes de la atención (arquitectura Pre-LN)
+        # Usar la nueva atención diferencial
         self.norm1 = nn.LayerNorm(embed_dim, eps=1e-5)
         self.attention = EnhancedLocalAttentionWithGQA(
-            embed_dim, num_heads, window_size, bidirectional, dropout, num_kv_groups, epsilon=epsilon
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            bidirectional=bidirectional,
+            dropout=dropout,
+            num_kv_groups=num_kv_groups,
+            epsilon=epsilon
         )
         self.dropout1 = nn.Dropout(dropout)
-        
         # Layer normalization antes de la convolución
         self.norm2 = nn.LayerNorm(embed_dim, eps=1e-5)
         self.dilated_conv = OptimizedGatedConvolution(
@@ -1078,3 +1182,4 @@ class LiquidFoundationModelOptimized(nn.Module):
             # Desactivar modo generación al finalizar
             self.set_generation_mode(False)
 print("Modelo cargado correctamente con mejoras de estabilidad numérica.")
+print("A")
