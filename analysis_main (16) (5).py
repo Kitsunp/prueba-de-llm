@@ -113,70 +113,40 @@ def final_verification(batch):
             if not torch.isfinite(value).all():
                 raise ValueError(f"Batch contiene valores no finitos en {key} después de la limpieza.")
     return batch
-def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta max_length según el modelo LED
+def prepare_data(max_samples=None, val_size=0.1, max_length=16384):
     try:
-        # Cargar dataset
         print("\n=== Iniciando Carga de Dataset ===")
         print("Cargando TIGER-Lab/WebInstructSub...")
         dataset = load_dataset("TIGER-Lab/WebInstructSub")
         print(f"Dataset cargado con éxito. Tamaño del conjunto de entrenamiento: {len(dataset['train'])}")
         
-        # Mostrar estructura del dataset
-        print("\nEstructura del dataset:")
-        print("Columnas disponibles:", dataset['train'].column_names)
-        sample = dataset['train'][0]
-        print("\nEjemplo de datos:")
-        for key, value in sample.items():
-            print(f"{key}: {value[:100]}..." if isinstance(value, str) else f"{key}: {value}")
-        
-        # Configurar tokenizer
         print("\n=== Configuración del Tokenizer ===")
-        print("Cargando tokenizer LED...")
+        print("Cargando tokenizer LED preentrenado...")
         tokenizer = LEDTokenizer.from_pretrained('allenai/led-base-16384')
-        special_tokens = {
-            'pad_token': '[PAD]', 
-            'eos_token': '<EOS>', 
-            'bos_token': '<BOS>',
-            'sep_token': '[SEP]'
-        }
-        num_added_toks = tokenizer.add_special_tokens(special_tokens)
-        print(f"Tokens especiales agregados: {num_added_toks}")
-        print(f"Vocabulario actual: {len(tokenizer)} tokens")
-        print("Tokens especiales:")
-        for token_name, token in special_tokens.items():
-            print(f"  - {token_name}: {token} (ID: {tokenizer.convert_tokens_to_ids(token)})")
-
-        # Limitar muestras
+        
+        # No añadimos tokens especiales ya que usaremos los del modelo preentrenado
+        print(f"Usando vocabulario preentrenado con {len(tokenizer)} tokens")
+        print("\nTokens especiales del modelo preentrenado:")
+        print(f"BOS Token: {tokenizer.bos_token} (ID: {tokenizer.bos_token_id})")
+        print(f"EOS Token: {tokenizer.eos_token} (ID: {tokenizer.eos_token_id})")
+        print(f"SEP Token: {tokenizer.sep_token} (ID: {tokenizer.sep_token_id})")
+        print(f"PAD Token: {tokenizer.pad_token} (ID: {tokenizer.pad_token_id})")
+        
         if max_samples is not None and max_samples < len(dataset['train']):
             dataset['train'] = dataset['train'].select(range(max_samples))
             print(f"\nDataset limitado a {max_samples} muestras")
-            print(f"Nuevo tamaño del conjunto de entrenamiento: {len(dataset['train'])}")
 
         def improved_preprocess_text(examples):
-            """
-            Preprocesa el texto aplicando varias transformaciones de limpieza.
-            """
             def clean_text(text):
                 if not isinstance(text, str):
                     print(f"Advertencia: texto no válido encontrado: {type(text)}")
                     return ""
-                
                 try:
-                    # Decodificar entidades HTML
                     text = html.unescape(text)
-                    
-                    # Normalizar caracteres Unicode
                     text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
-                    
-                    # Eliminar URLs
                     text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-                    
-                    # Normalizar espacios en blanco
                     text = re.sub(r'\s+', ' ', text).strip()
-                    
-                    # Eliminar espacios antes de la puntuación
                     text = re.sub(r'\s([?.!,:](?:\s|$))', r'\1', text)
-                    
                     return text
                 except Exception as e:
                     print(f"Error en clean_text: {str(e)}")
@@ -191,7 +161,6 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
                 clean_a = clean_text(answer)
                 
                 if not clean_q.strip() or not clean_a.strip():
-                    print("Advertencia: pregunta o respuesta vacía después de limpieza")
                     clean_q = question if not clean_q.strip() else clean_q
                     clean_a = answer if not clean_a.strip() else clean_a
                 
@@ -203,43 +172,14 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
                 'cleaned_answer': cleaned_answers
             }
 
-        def sample_text(examples, max_length):
-
-            print("\n=== Iniciando Muestreo de Texto ===")
-            sampled_questions = []
-            sampled_answers = []
-            
-            for q, a in zip(examples['cleaned_question'], examples['cleaned_answer']):
-                total_length = len(q) + len(a) + 3  # BOS, SEP, EOS
-                
-                if total_length > max_length:
-                    # Distribuir el espacio proporcionalmente
-                    q_ratio = len(q) / total_length
-                    a_ratio = len(a) / total_length
-                    
-                    max_q_len = int((max_length - 3) * q_ratio)
-                    max_a_len = int((max_length - 3) * a_ratio)
-                    
-                    q = q[:max_q_len]
-                    a = a[:max_a_len]
-                
-                sampled_questions.append(q)
-                sampled_answers.append(a)
-            
-            return {
-                'sampled_question': sampled_questions,
-                'sampled_answer': sampled_answers
-            }
-
-        def tokenize_data(examples, tokenizer, max_length=16384, verbose=True):  # Ajustar max_length
+        def tokenize_data(examples, tokenizer, max_length=16384, verbose=True):
             try:
-                # Combinar pregunta y respuesta con tokens especiales
+                # Usar los tokens especiales del modelo preentrenado
                 combined_texts = [
                     f"{tokenizer.bos_token}{q}{tokenizer.sep_token}{a}{tokenizer.eos_token}"
-                    for q, a in zip(examples['sampled_question'], examples['sampled_answer'])
+                    for q, a in zip(examples['cleaned_question'], examples['cleaned_answer'])
                 ]
                 
-                # Tokenización
                 tokens = tokenizer(
                     combined_texts,
                     truncation=True,
@@ -248,7 +188,6 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
                     return_attention_mask=True
                 )
                 
-                # Preparar decoder_input_ids y labels
                 decoder_input_ids = []
                 labels = []
                 
@@ -256,65 +195,28 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
                     try:
                         sep_pos = ids.index(tokenizer.sep_token_id)
                     except ValueError:
-                        # Asignar sep_pos de manera predeterminada si no se encuentra el sep_token
-                        sep_pos = len(ids) // 2  # Por ejemplo, dividir la secuencia a la mitad
-                        print(f"Advertencia: sep_token_id no encontrado. Asignando sep_pos a {sep_pos}.")
-
-                    # decoder_input_ids: desde SEP hasta EOS-1
+                        sep_pos = len(ids) // 2
+                    
                     decoder_ids = [tokenizer.bos_token_id] + ids[sep_pos+1:-1]
-                    # Padding
                     decoder_ids = decoder_ids + [tokenizer.pad_token_id] * (max_length - 1 - len(decoder_ids))
-
-                    # labels: desde SEP+1 hasta EOS
+                    
                     label_ids = ids[sep_pos+1:]
-                    # Padding con -100
                     label_ids = label_ids + [-100] * (max_length - 1 - len(label_ids))
-
+                    
                     decoder_input_ids.append(decoder_ids)
                     labels.append(label_ids)
-                
                 
                 tokens['decoder_input_ids'] = decoder_input_ids
                 tokens['labels'] = labels
                 
-                # Mostrar ejemplo de tokenización para el primer elemento del batch
                 if verbose and len(tokens['input_ids']) > 0:
                     print("\n=== Ejemplo de Tokenización del Batch ===")
-                    print("\n1. Texto Original:")
-                    print(f"Pregunta: {examples['sampled_question'][0]}")
-                    print(f"Respuesta: {examples['sampled_answer'][0]}")
-                    
-                    print("\n2. Texto Combinado:")
-                    print(combined_texts[0])
-                    
-                    print("\n3. Tokens (IDs):")
-                    print(f"Input IDs: {tokens['input_ids'][0][:50]}...")
-                    print(f"Decoder Input IDs: {tokens['decoder_input_ids'][0][:50]}...")
-                    print(f"Labels: {[l for l in tokens['labels'][0][:50] if l != -100]}...")
-                    
-                    print("\n4. Tokens Decodificados:")
-                    print(f"Input: {tokenizer.decode(tokens['input_ids'][0])[:100]}...")
-                    print(f"Decoder Input: {tokenizer.decode(tokens['decoder_input_ids'][0])[:100]}...")
-                    print(f"Labels (sin padding): {tokenizer.decode([l for l in tokens['labels'][0] if l != -100])[:100]}...")
-                    
-                    print("\n5. Estadísticas:")
-                    print(f"Longitud total de input_ids: {len(tokens['input_ids'][0])}")
-                    print(f"Longitud total de decoder_input_ids: {len(tokens['decoder_input_ids'][0])}")
-                    print(f"Tokens válidos en labels: {sum(1 for l in tokens['labels'][0] if l != -100)}")
-                    print(f"Tokens de padding en labels: {sum(1 for l in tokens['labels'][0] if l == -100)}")
-                    
-                    print("\n6. Tokens Especiales:")
-                    special_tokens = {
-                        'BOS': tokenizer.bos_token_id,
-                        'EOS': tokenizer.eos_token_id,
-                        'SEP': tokenizer.sep_token_id,
-                        'PAD': tokenizer.pad_token_id
-                    }
-                    for name, token_id in special_tokens.items():
-                        count = tokens['input_ids'][0].count(token_id)
-                        print(f"{name} token (ID: {token_id}) aparece {count} veces")
-                    
-                    print("\n=== Fin del Ejemplo de Tokenización ===\n")
+                    print(f"Texto Original (Primeros 100 caracteres):")
+                    print(f"Pregunta: {examples['cleaned_question'][0][:100]}")
+                    print(f"Respuesta: {examples['cleaned_answer'][0][:100]}")
+                    print(f"\nTokens Decodificados (Primeros 100 caracteres):")
+                    print(f"Input: {tokenizer.decode(tokens['input_ids'][0])[:100]}")
+                    print(f"Decoder Input: {tokenizer.decode(tokens['decoder_input_ids'][0])[:100]}")
                 
                 return tokens
                     
@@ -327,11 +229,8 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
                     'attention_mask': [[0] * max_length]
                 }
 
-
-        # Aplicar pipeline de procesamiento
         print("\n=== Iniciando Pipeline de Procesamiento ===")
         
-        print("\n1. Preprocesamiento...")
         processed_dataset = dataset['train'].map(
             improved_preprocess_text,
             batched=True,
@@ -339,36 +238,11 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
             desc="Preprocesando textos"
         )
         
-        print("\n2. Muestreo...")
-        sampled_dataset = processed_dataset.map(
-            lambda x: sample_text(x, max_length),
-            batched=True,
-            remove_columns=processed_dataset.column_names,
-            desc="Muestreando textos"
-        )
-        
-        print("\n3. Tokenización...")
-        tokenized_dataset = sampled_dataset.map(
+        tokenized_dataset = processed_dataset.map(
             lambda x: tokenize_data(x, tokenizer, max_length=max_length),
             batched=True,
-            remove_columns=sampled_dataset.column_names,
+            remove_columns=processed_dataset.column_names,
             desc="Tokenizando textos"
-        )
-        
-        # Verificaciones y formato PyTorch
-        print("\n=== Verificaciones Finales ===")
-        tokenized_dataset = tokenized_dataset.map(
-            verify_no_nans,
-            batched=True,
-            batch_size=1000,
-            desc="Verificando valores no finitos"
-        )
-        
-        tokenized_dataset = tokenized_dataset.map(
-            final_verification,
-            batched=True,
-            batch_size=1000,
-            desc="Verificación final"
         )
         
         print("\n=== Configurando Formato PyTorch ===")
@@ -377,8 +251,6 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
             columns=['input_ids', 'decoder_input_ids', 'labels', 'attention_mask']
         )
         
-        # División del dataset
-        print("\n=== Dividiendo Dataset ===")
         train_val_dataset = tokenized_dataset.train_test_split(test_size=val_size)
         
         print("\nTamaños finales:")
@@ -386,11 +258,12 @@ def prepare_data(max_samples=None, val_size=0.1, max_length=16384):  # Ajusta ma
         print(f"Validation: {len(train_val_dataset['test'])}")
         
         return tokenizer, train_val_dataset
+
     except Exception as e:
         print(f"Error en prepare_data: {str(e)}")
-        raise e           
-print("G")
-def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scaler, device, tokenizer, accumulation_steps, metrics_tracker):
+        raise e    
+
+def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scaler, device, tokenizer, accumulation_steps, metrics_tracker, compute_non_essential_metrics=False):
     try:
         encoder_input_ids = batch['input_ids'].to(device)
         decoder_input_ids = batch['decoder_input_ids'].to(device)
@@ -408,7 +281,7 @@ def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scal
             valid_labels = labels_flat[mask]
 
             if valid_labels.numel() > 0:
-                # Pérdidas
+                # Cálculo de pérdidas
                 ce_loss = ce_criterion(valid_logits, valid_labels)
                 focal_loss = focal_criterion(valid_logits, valid_labels)
                 total_loss = (
@@ -424,12 +297,12 @@ def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scal
                 scaled_loss = total_loss / accumulation_steps
                 scaler.scale(scaled_loss).backward()
 
-                # Predictions
+                # Predicciones
                 predictions = valid_logits.argmax(dim=-1)
                 pred_tokens = predictions.cpu().tolist()
                 true_tokens = valid_labels.cpu().tolist()
 
-                # Actualizar métricas de loss
+                # Actualizar métricas de pérdida
                 metrics_tracker['total_loss'] += total_loss.item() * valid_labels.numel()
                 metrics_tracker['ce_loss'] += ce_loss.item() * valid_labels.numel()
                 metrics_tracker['focal_loss'] += focal_loss.item() * valid_labels.numel()
@@ -439,11 +312,11 @@ def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scal
                 metrics_tracker['entropy_loss_dec'] += entropy_loss_dec.item() * valid_labels.numel()
                 metrics_tracker['valid_tokens'] += valid_labels.numel()
 
-                # Accuracy metrics
+                # Métricas de exactitud
                 correct_tokens = (predictions == valid_labels).sum().item()
                 metrics_tracker['correct_tokens'] += correct_tokens
 
-                # Sequence accuracy
+                # Exactitud por secuencia
                 batch_predictions = outputs.argmax(dim=-1)
                 correct_sequences = (batch_predictions == labels).all(dim=1).sum().item()
                 metrics_tracker['correct_sequences'] += correct_sequences
@@ -455,7 +328,7 @@ def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scal
                     correct_k = sum(valid_labels[i] in top_k_preds[i] for i in range(len(valid_labels)))
                     metrics_tracker[f'top_k_accuracy_{k}'] += float(correct_k)
 
-                # Vocabulary y diversidad
+                # Diversidad y vocabulario
                 metrics_tracker['pred_tokens'].extend(pred_tokens)
                 metrics_tracker['true_tokens'].extend(true_tokens)
                 metrics_tracker['unique_unigrams'].update(pred_tokens)
@@ -465,49 +338,47 @@ def train_one_batch(batch, model, ce_criterion, focal_criterion, optimizer, scal
                 for i in range(len(pred_tokens) - 1):
                     metrics_tracker['unique_bigrams'].add((pred_tokens[i], pred_tokens[i + 1]))
 
-                # BLEU score
-                decoded_preds = tokenizer.batch_decode(predictions.unsqueeze(1), skip_special_tokens=True)
-                decoded_labels = tokenizer.batch_decode(valid_labels.unsqueeze(1), skip_special_tokens=True)
-                
-                # BLEU score - Versión corregida
-                try:
+                if compute_non_essential_metrics:
+                    # BLEU Scores
                     decoded_preds = tokenizer.batch_decode(predictions.unsqueeze(1), skip_special_tokens=True)
                     decoded_labels = tokenizer.batch_decode(valid_labels.unsqueeze(1), skip_special_tokens=True)
                     
-                    smoothing = SmoothingFunction().method1
-                    for n in range(1, 5):
-                        weights = tuple([1.0/n] * n + [0.0] * (4-n))
-                        batch_bleu = np.mean([
-                            sentence_bleu(
-                                [ref.split()],  # Referencias deben estar en una lista
-                                hyp.split(),
-                                weights=weights,
-                                smoothing_function=smoothing
-                            )
-                            for ref, hyp in zip(decoded_labels, decoded_preds)
-                        ])
-                        # Acumulamos el promedio del batch
-                        metrics_tracker[f'bleu_{n}'] += batch_bleu
-                        metrics_tracker[f'bleu_batches'] = metrics_tracker.get('bleu_batches', 0) + 1
+                    try:
+                        smoothing = SmoothingFunction().method1
+                        for n in range(1, 5):
+                            weights = tuple([1.0/n] * n + [0.0] * (4-n))
+                            batch_bleu = np.mean([
+                                sentence_bleu(
+                                    [ref.split()],  # Referencias deben estar en una lista
+                                    hyp.split(),
+                                    weights=weights,
+                                    smoothing_function=smoothing
+                                )
+                                for ref, hyp in zip(decoded_labels, decoded_preds)
+                            ])
+                            # Acumular el promedio del batch
+                            metrics_tracker[f'bleu_{n}'] += batch_bleu
+                            metrics_tracker[f'bleu_batches'] = metrics_tracker.get('bleu_batches', 0) + 1
 
-                except Exception as e:
-                    print(f"Error calculando BLEU: {str(e)}")
+                    except Exception as e:
+                        print(f"Error calculando BLEU: {str(e)}")
 
-                # Fluidez
-                seq_lengths = (labels != -100).sum(dim=1).cpu().tolist()
-                metrics_tracker['sequence_lengths'].extend(seq_lengths)
+                    # Fluidez
+                    seq_lengths = (labels != -100).sum(dim=1).cpu().tolist()
+                    metrics_tracker['sequence_lengths'].extend(seq_lengths)
 
-                # Perplejidad
-                log_probs = F.log_softmax(valid_logits, dim=-1)
-                token_perplexities = torch.exp(-torch.gather(
-                    log_probs, 1, valid_labels.unsqueeze(1)
-                )).squeeze(1)
-                metrics_tracker['perplexities'].extend(token_perplexities.cpu().tolist())
+                    # Perplejidad
+                    log_probs = F.log_softmax(valid_logits, dim=-1)
+                    token_perplexities = torch.exp(-torch.gather(
+                        log_probs, 1, valid_labels.unsqueeze(1)
+                    )).squeeze(1)
+                    metrics_tracker['perplexities'].extend(token_perplexities.cpu().tolist())
 
     except Exception as e:
         print(f"Error en train_one_batch: {str(e)}")
         traceback.print_exc()
         raise e
+
 
 
 def calculate_rouge(predictions, references):
@@ -546,7 +417,6 @@ def calculate_meteor(predictions, references):  # <- ACTUALIZAR ESTA
     
     return np.mean(meteor_scores) if meteor_scores else 0.0
 def evaluate(model, data_loader, ce_criterion, focal_criterion, device, tokenizer):
-
     model.eval()
     metrics = {
         'total_loss': 0.0,
@@ -742,6 +612,7 @@ def evaluate(model, data_loader, ce_criterion, focal_criterion, device, tokenize
         }
 
     return final_metrics
+
 print("G")
 def log_metrics(writer, train_metrics, val_metrics, epoch):
 
@@ -764,14 +635,22 @@ def log_metrics(writer, train_metrics, val_metrics, epoch):
     # Fluidez
     writer.add_scalar('Fluency/avg_sequence_length', float(np.mean(train_metrics['sequence_lengths'])) if train_metrics['sequence_lengths'] else 0.0, epoch)
 
-    # BLEU
-    for n in range(1, 5):
-        writer.add_scalar(f'BLEU/bleu_{n}', train_metrics[f'bleu_{n}'], epoch)
+    # BLEU Scores
+    if train_metrics.get('bleu_batches', 0) > 0:
+        for n in range(1, 5):
+            bleu_key = f'bleu_{n}'
+            bleu_avg = train_metrics[bleu_key] / train_metrics['bleu_batches']
+            writer.add_scalar(f'BLEU/bleu_{n}', bleu_avg, epoch)
+            print(f"BLEU-{n}: {bleu_avg:.4f}")
+    else:
+        for n in range(1, 5):
+            writer.add_scalar(f'BLEU/bleu_{n}', 0.0, epoch)
+            print(f"BLEU-{n}: 0.0")
 
     # Vocabulario
     writer.add_scalar('Vocabulary/vocab_size', train_metrics['vocab_size'], epoch)
 
-    # Nuevas Métricas
+    # Nuevas Métricas (ROUGE y METEOR)
     writer.add_scalar('ROUGE/ROUGE-1', val_metrics['rouge1'], epoch)
     writer.add_scalar('ROUGE/ROUGE-2', val_metrics['rouge2'], epoch)
     writer.add_scalar('ROUGE/ROUGE-L', val_metrics['rougeL'], epoch)
@@ -802,13 +681,17 @@ def log_metrics(writer, train_metrics, val_metrics, epoch):
     print(f"Avg Sequence Length: {float(np.mean(train_metrics['sequence_lengths'])) if train_metrics['sequence_lengths'] else 0.0:.2f}")
 
     # BLEU Scores
-    num_batches = train_metrics.get('bleu_batches', 1)  # Evitar división por cero
-    print("\n--- BLEU Scores ---")
-    for n in range(1, 5):
-        # Calculamos el promedio dividiendo por el número de batches
-        avg_bleu = train_metrics[f'bleu_{n}'] / num_batches
-        writer.add_scalar(f'BLEU/bleu_{n}', avg_bleu, epoch)
-        print(f"BLEU-{n}: {avg_bleu:.4f}")
+    if train_metrics.get('bleu_batches', 0) > 0:
+        num_batches = train_metrics['bleu_batches']
+        print("\n--- BLEU Scores ---")
+        for n in range(1, 5):
+            avg_bleu = train_metrics[f'bleu_{n}'] / num_batches
+            writer.add_scalar(f'BLEU/bleu_{n}', avg_bleu, epoch)
+            print(f"BLEU-{n}: {avg_bleu:.4f}")
+    else:
+        print("\n--- BLEU Scores ---")
+        for n in range(1, 5):
+            print(f"BLEU-{n}: 0.0")
 
     print("\n--- Métricas de Vocabulario ---")
     print(f"Vocab Size: {train_metrics['vocab_size']}")
@@ -818,6 +701,7 @@ def log_metrics(writer, train_metrics, val_metrics, epoch):
     print(f"ROUGE-2: {val_metrics['rouge2']:.4f}")
     print(f"ROUGE-L: {val_metrics['rougeL']:.4f}")
     print(f"METEOR: {val_metrics['meteor']:.4f}")
+import math
 
 def train_model(
     model, 
@@ -918,6 +802,7 @@ def train_model(
             'bleu_2': 0.0,
             'bleu_3': 0.0,
             'bleu_4': 0.0,
+            'bleu_batches': 0,  # Contador para promediar        
             'bleu_1_samples': 0,
             'bleu_2_samples': 0,
             'bleu_3_samples': 0,
@@ -936,7 +821,7 @@ def train_model(
         return evaluate(model, data_loader, ce_criterion, focal_criterion, device, tokenizer)
 
     try:
-        # Verify model parameters
+        # Verificar parámetros del modelo
         print("Checking model parameters that don't require gradients...")
         frozen_params = []
         for name, param in model.named_parameters():
@@ -955,14 +840,30 @@ def train_model(
             print(f"\n--- Epoch {epoch + 1} ---")
             reset_metrics()  # Reset metrics al inicio de cada época
 
+            total_batches = len(train_loader)
+            num_metrics_batches = max(1, int(math.ceil(0.05 * total_batches)))  # 5% de los batches
+            # Seleccionar los últimos num_metrics_batches indices
+            metrics_batch_indices = list(range(total_batches - num_metrics_batches, total_batches))
+            print(f"Métricas no esenciales se calcularán en los batches: {metrics_batch_indices}")
+
             loop = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}")
 
             for batch_idx, batch in loop:
+                compute_non_essential = batch_idx in metrics_batch_indices
+
                 try:
                     train_one_batch(
-                        batch, model, ce_criterion, focal_criterion, 
-                        optimizer, scaler, device, tokenizer,
-                        accumulation_steps, metrics_tracker
+                        batch, 
+                        model, 
+                        ce_criterion, 
+                        focal_criterion, 
+                        optimizer, 
+                        scaler, 
+                        device, 
+                        tokenizer,
+                        accumulation_steps, 
+                        metrics_tracker,
+                        compute_non_essential_metrics=compute_non_essential  # Nuevo parámetro
                     )
 
                     if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
@@ -994,7 +895,7 @@ def train_model(
                 val_losses.append(val_metrics['total_loss'])
                 val_perplexities.append(val_metrics['perplexity'])
 
-                print(f"\nEpoch {epoch + 1} completed. Evaluating model...")
+                print(f"\nEpoch {epoch + 1} completed. Evaluando modelo...")
 
                 # Loguear métricas
                 log_metrics(writer, metrics_tracker, val_metrics, epoch + 1)
@@ -1022,11 +923,11 @@ def train_model(
                             'perplexities': val_perplexities
                         }
                     }, 'best_model.pth')
-                    print("\nSaved new best model!")
+                    print("\n¡Nuevo mejor modelo guardado!")
                 else:
                     no_improve += 1
                     if no_improve >= patience:
-                        print("\nEarly stopping triggered")
+                        print("\nSe ha activado el early stopping")
                         break
 
                 del val_metrics
@@ -1034,10 +935,10 @@ def train_model(
                 gc.collect()
 
                 epoch += 1
-                print(f"\nEpoch {epoch} completed. Batches processed: {len(train_loader)}")
+                print(f"\nEpoch {epoch} completada. Batches procesados: {len(train_loader)}")
 
             except KeyboardInterrupt:
-                print("\nTraining interrupted by user")
+                print("\nEntrenamiento interrumpido por el usuario")
                 break
 
     finally:
@@ -1053,14 +954,14 @@ def train_model(
             plt.subplot(1, 2, 1)
             plt.plot(train_losses, label='Train')
             plt.plot(val_losses, label='Val')
-            plt.title('Loss Evolution')
+            plt.title('Evolución de la Pérdida')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
             plt.legend()
 
             plt.subplot(1, 2, 2)
             plt.plot(val_perplexities)
-            plt.title('Perplexity Evolution')
+            plt.title('Evolución de la Perplejidad')
             plt.xlabel('Epoch')
             plt.ylabel('Perplexity')
             plt.yscale('log')
@@ -1069,20 +970,21 @@ def train_model(
             plt.savefig('training_evolution.png')
             plt.close()
 
-            print("\nFinal visualizations saved in 'training_evolution.png'")
+            print("\nVisualizaciones finales guardadas en 'training_evolution.png'")
         except Exception as e:
-            print(f"Error generating final visualizations: {str(e)}")
+            print(f"Error generando visualizaciones finales: {str(e)}")
             traceback.print_exc()
 
     return train_losses, val_losses, val_perplexities
+
 def main_analysis():
     print("\n=== Iniciando Análisis Principal ===")
     
     # Configuración inicial
     config = {
-        'max_samples': 3000,
+        'max_samples': 1500,
         'val_size': 0.1,
-        'max_length': 400,  # Ajustado para LED
+        'max_length': 500,  # Ajustado para LED
         'batch_size': 4,
         'num_epochs': 5,  # Ajusta según tus necesidades
         'lr': 0.0001,
@@ -1100,14 +1002,32 @@ def main_analysis():
     tokenizer, datasets = prepare_data(max_samples=config['max_samples'], 
                                         val_size=config['val_size'], 
                                         max_length=config['max_length'])
-    VOCAB_SIZE = len(tokenizer)
-    print(f"\nTamaño del vocabulario: {VOCAB_SIZE}")
-
+    
     train_loader = DataLoader(datasets['train'], batch_size=config['batch_size'], shuffle=True)
     val_loader = DataLoader(datasets['test'], batch_size=config['batch_size'], shuffle=False)
 
-    # Crear el modelo con el vocab_size correcto
-    model = LiquidFoundationModelOptimized(vocab_size=VOCAB_SIZE).to(device)
+    vocab_size = len(tokenizer)  # Usar el tamaño del vocabulario del tokenizador preentrenado
+    
+    model = LiquidFoundationModelOptimized(
+        vocab_size=vocab_size,  # Usar el vocabulario preentrenado
+        embed_dim=512,
+        num_layers=12,
+        num_heads=8,
+        ff_hidden_dim=1024,
+        num_experts=8,
+        expert_dim=512,
+        max_length=8192,
+        window_size=512,
+        compression_ratio=0.5,
+        entropy_weight=0.15,
+        top_k=4,
+        dynamic_k=True,
+        lstm_hidden_size=256,
+        lstm_num_layers=2,
+        dropout=0.1
+    ).to(device)
+    
+    print(f"Modelo inicializado con vocabulario del tokenizador preentrenado (tamaño: {vocab_size})")
 
     # Verificar el tamaño de la capa de salida
     print(f"Shape de output_layer.weight: {model.output_layer.weight.shape}")
@@ -1122,7 +1042,8 @@ def main_analysis():
     else:
         print(f"❌ Error: La capa de salida tiene {actual_out_features} out_features, pero se esperaba {expected_vocab_size}.")
         # Ajustar la capa de salida si es necesario
-        model.output_layer = nn.Linear(embed_dim, expected_vocab_size)
+        embed_dim = model.output_layer.in_features  # Obtener la dimensión de embedding
+        model.output_layer = nn.Linear(embed_dim, expected_vocab_size).to(device)
         print(f"✅ Capa de salida ajustada a {expected_vocab_size} out_features.")
 
     # Verificar tokens especiales
@@ -1241,6 +1162,7 @@ def main_analysis():
         }
     }
 
+
 def analyze_token_transformations_extended(model, tokenizer, prompt, train_dataloader, val_dataloader, 
                                             max_length=50, min_length=10, temperature=0.7, top_k=50):
 
@@ -1333,7 +1255,7 @@ def analyze_token_transformations(
     top_p=0.9,
     repetition_penalty=1.2,
     length_penalty=1.0,
-    num_beams=4,
+    num_beams=2,
     dynamic_temperature=True,
     dynamic_temp_factor=0.85,
     diversity_penalty=0.3,      
@@ -1597,6 +1519,6 @@ class ComputationCache:
 def get_cache_key(sequences):
     """Genera una clave de caché robusta usando SHA256."""  
     return hashlib.sha256(sequences.cpu().numpy().tobytes()).hexdigest()
-
+print("G")
 if __name__ == "__main__":
     results = main_analysis()
